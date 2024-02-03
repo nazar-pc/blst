@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::mem::MaybeUninit;
 use core::ptr;
+use rayon::prelude::*;
 use zeroize::Zeroize;
 
 #[cfg(feature = "std")]
@@ -177,58 +178,27 @@ impl blst_fp12 {
             panic!("inputs' lengths mismatch");
         }
 
-        let pool = mt::da_pool();
+        let num_threads = rayon::current_num_threads();
+        let stride =
+            core::cmp::min((n_elems + num_threads - 1) / num_threads, 16);
 
-        let mut n_workers = pool.max_count();
-        if n_workers == 1 {
-            let qs: [*const _; 2] = [&q[0], ptr::null()];
-            let ps: [*const _; 2] = [&p[0], ptr::null()];
-            let mut out = MaybeUninit::<blst_fp12>::uninit();
-            unsafe {
-                blst_miller_loop_n(out.as_mut_ptr(), &qs[0], &ps[0], n_elems);
-                return out.assume_init();
-            }
-        }
-
-        let (tx, rx) = channel();
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let stride = core::cmp::min((n_elems + n_workers - 1) / n_workers, 16);
-        n_workers = core::cmp::min((n_elems + stride - 1) / stride, n_workers);
-        for _ in 0..n_workers {
-            let tx = tx.clone();
-            let counter = counter.clone();
-
-            pool.joined_execute(move || {
-                let mut acc = blst_fp12::default();
+        (0..n_elems)
+            .into_par_iter()
+            .step_by(stride)
+            .zip(q.par_chunks(stride).zip(p.par_chunks(stride)))
+            .map(|(start_offset, (q, p))| {
                 let mut tmp = MaybeUninit::<blst_fp12>::uninit();
-                let mut qs: [*const _; 2] = [ptr::null(), ptr::null()];
-                let mut ps: [*const _; 2] = [ptr::null(), ptr::null()];
+                let qs: [*const _; 2] = [q.as_ptr(), ptr::null()];
+                let ps: [*const _; 2] = [p.as_ptr(), ptr::null()];
 
-                loop {
-                    let work = counter.fetch_add(stride, Ordering::Relaxed);
-                    if work >= n_elems {
-                        break;
-                    }
-                    let n = core::cmp::min(n_elems - work, stride);
-                    qs[0] = &q[work];
-                    ps[0] = &p[work];
-                    unsafe {
-                        blst_miller_loop_n(tmp.as_mut_ptr(), &qs[0], &ps[0], n);
-                        acc *= tmp.assume_init();
-                    }
+                let n = core::cmp::min(n_elems - start_offset, stride);
+                unsafe {
+                    blst_miller_loop_n(tmp.as_mut_ptr(), &qs[0], &ps[0], n);
+                    tmp.assume_init()
                 }
-
-                tx.send(acc).expect("disaster");
-            });
-        }
-
-        let mut acc = rx.recv().unwrap();
-        for _ in 1..n_workers {
-            acc *= rx.recv().unwrap();
-        }
-
-        acc
+            })
+            .reduce_with(|a, b| a * b)
+            .unwrap_or_else(blst_fp12::default)
     }
 
     pub fn final_exp(&self) -> Self {
