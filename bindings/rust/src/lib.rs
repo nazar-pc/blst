@@ -1194,56 +1194,49 @@ macro_rules! sig_variant_impl {
 
                 // TODO - check msg uniqueness?
 
-                let pool = mt::da_pool();
-                let (tx, rx) = channel();
-                let counter = Arc::new(AtomicUsize::new(0));
-                let valid = Arc::new(AtomicBool::new(true));
-
-                let n_workers = core::cmp::min(pool.max_count(), n_elems);
-                for _ in 0..n_workers {
-                    let tx = tx.clone();
-                    let counter = counter.clone();
-                    let valid = valid.clone();
-
-                    pool.joined_execute(move || {
-                        let mut pairing = Pairing::new($hash_or_encode, dst);
-
-                        // TODO - engage multi-point mul-n-add for larger
-                        // amount of inputs...
-                        while valid.load(Ordering::Relaxed) {
-                            let work = counter.fetch_add(1, Ordering::Relaxed);
-                            if work >= n_elems {
-                                break;
-                            }
-
+                let success = pks
+                    .par_iter()
+                    .zip(sigs)
+                    .zip(rands)
+                    .zip(msgs)
+                    .try_fold_with(
+                        Pairing::new($hash_or_encode, dst),
+                        |mut pairing, (((pk, sig), rand), msg)| {
                             if pairing.mul_n_aggregate(
-                                &pks[work].point,
+                                &pk.point,
                                 pks_validate,
-                                &sigs[work].point,
+                                &sig.point,
                                 sigs_groupcheck,
-                                &rands[work].b,
+                                &rand.b,
                                 rand_bits,
-                                msgs[work],
+                                msg,
                                 &[],
-                            ) != BLST_ERROR::BLST_SUCCESS
+                            ) == BLST_ERROR::BLST_SUCCESS
                             {
-                                valid.store(false, Ordering::Relaxed);
-                                break;
+                                Some(pairing)
+                            } else {
+                                None
                             }
-                        }
-                        if valid.load(Ordering::Relaxed) {
+                        },
+                    )
+                    .map(|mut maybe_pairing| {
+                        if let Some(pairing) = &mut maybe_pairing {
                             pairing.commit();
                         }
-                        tx.send(pairing).expect("disaster");
-                    });
-                }
+                        maybe_pairing
+                    })
+                    .try_reduce_with(|mut a, b| {
+                        if a.merge(&b) == BLST_ERROR::BLST_SUCCESS {
+                            Some(a)
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten()
+                    .map(|acc| acc.finalverify(None))
+                    .unwrap_or_default();
 
-                let mut acc = rx.recv().unwrap();
-                for _ in 1..n_workers {
-                    acc.merge(&rx.recv().unwrap());
-                }
-
-                if valid.load(Ordering::Relaxed) && acc.finalverify(None) {
+                if success {
                     BLST_ERROR::BLST_SUCCESS
                 } else {
                     BLST_ERROR::BLST_VERIFY_FAIL
